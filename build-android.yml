@@ -1,0 +1,198 @@
+name: Build APK Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      opt_level:
+        description: 'Otimizacao do C gerado (3, 2 ou s)'
+        required: false
+        type: choice
+        options: ['3', '2', 's']
+        default: '3'
+      icache_off:
+        description: 'Desligar emulacao do icache do PS1'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PSX_COMMIT: f7672e53b8504fd20bd2b2ad70e62adc6a87a5de
+  SDL_TAG: release-3.2.8
+  PROJ: soul-reaver-recipe
+  DISC_NAME: Legacy of Kain - Soul Reaver (Europe)
+  BIOS_NAME: SCPH5552.BIN
+  EXPECTED_MD5: 9e38befb10415dd4d2fee9d02cf016e7
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Liberar disco e instalar ferramentas
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build ccache python3
+          df -h /
+
+      - name: Baixar disco e BIOS (release disc-assets)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROJ/disc" assets-dl
+          gh release download disc-assets --repo "$GITHUB_REPOSITORY" --dir assets-dl
+          ls -la assets-dl
+          BIN=$(find assets-dl -maxdepth 1 -iname '*.bin' ! -iname 'scph*' | head -1)
+          BIOS=$(find assets-dl -maxdepth 1 -iname 'scph5552.bin' | head -1)
+          test -n "$BIN" && test -n "$BIOS"
+          cp "$BIN" "$PROJ/disc/$DISC_NAME.bin"
+          printf 'FILE "%s.bin" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n' "$DISC_NAME" > "$PROJ/disc/$DISC_NAME.cue"
+          cp "$BIOS" "assets-dl/$BIOS_NAME"
+          GOT=$(md5sum "$PROJ/disc/$DISC_NAME.bin" | cut -d' ' -f1)
+          echo "MD5 do .bin: $GOT (esperado: $EXPECTED_MD5)"
+          if [ "$GOT" != "$EXPECTED_MD5" ]; then echo "::warning::MD5 do disco difere do esperado"; fi
+
+      - name: Obter psxrecomp no commit pinado
+        run: |
+          set -euo pipefail
+          git clone https://github.com/Alexbeav/psxrecomp.git "$PROJ/psxrecomp"
+          git -C "$PROJ/psxrecomp" checkout "$PSX_COMMIT"
+          mkdir -p "$PROJ/psxrecomp/bios" "$PROJ/bios"
+          cp "assets-dl/$BIOS_NAME" "$PROJ/psxrecomp/bios/$BIOS_NAME"
+          cp "assets-dl/$BIOS_NAME" "$PROJ/bios/$BIOS_NAME"
+
+      - name: Aplicar patches
+        run: |
+          set -euo pipefail
+          P="$PROJ/psxrecomp"
+          # 0001 (fibras) e obrigatorio
+          git -C "$P" apply --check "$GITHUB_WORKSPACE/patches/0001-psxrecomp-android-fiber-backend.patch"
+          git -C "$P" apply "$GITHUB_WORKSPACE/patches/0001-psxrecomp-android-fiber-backend.patch"
+          # demais sao atomicos e toleraveis
+          python3 patches/0002-gles-compat.py "$P" || echo "::warning::0002 (GLES) nao aplicou; app usa renderer software"
+          python3 patches/0003-perf.py "$P" || echo "::warning::0003 nao aplicou"
+          python3 patches/0004-texel-inline.py "$P" || echo "::warning::0004 nao aplicou"
+
+      - name: Teste das fibras (host x86_64)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          P="$PROJ/psxrecomp"
+          gcc -O1 -DPSX_FIBER_ASM -I"$P/runtime/include" tests/fibertest.c "$P/runtime/src/psx_fiber.c" -lm -o /tmp/fibertest
+          /tmp/fibertest
+
+      - name: Compilar emissores (psxrecomp-game / psxrecomp-bios)
+        working-directory: ${{ env.PROJ }}
+        run: |
+          set -euo pipefail
+          bash ./psxrecomp/tools/ci/build_emitters.sh
+          find psxrecomp -type f \( -name psxrecomp-game -o -name psxrecomp-bios \) -print
+
+      - name: Gerar o C do jogo
+        working-directory: ${{ env.PROJ }}
+        run: |
+          set -euo pipefail
+          GAME_BIN=$(find psxrecomp -type f -name psxrecomp-game | head -1)
+          BIOS_BIN=$(find psxrecomp -type f -name psxrecomp-bios | head -1)
+          test -n "$GAME_BIN" && test -n "$BIOS_BIN"
+          GAME_BIN=$(realpath "$GAME_BIN"); BIOS_BIN=$(realpath "$BIOS_BIN")
+          # 1) generate so prepara o disco (para na checagem de BIOS: esperado)
+          python3 psxrecomp/psxrecomp_cli.py generate --config game.toml --project-root . \
+            --disc "disc/$DISC_NAME.cue" || echo "generate parou (esperado: so conhece SCPH1001)"
+          # 2) BIOS SCPH5552
+          (cd psxrecomp && "$BIOS_BIN" --config bios/SCPH5552.toml)
+          # 3) C do jogo
+          "$GAME_BIN" --config game.toml
+          ls generated | head
+          echo "arquivos gerados: $(ls generated | wc -l)"
+          du -sh generated
+
+      - name: Instalar NDK/CMake config e compilar SDL3
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          git clone --depth 1 --branch "$SDL_TAG" https://github.com/libsdl-org/SDL.git sdl-src
+          cmake -S sdl-src -B sdl-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+            -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/sdl-install"
+          cmake --build sdl-build -j"$(nproc)"
+          cmake --install sdl-build
+
+      - name: Cache do ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.PSX_COMMIT }}-${{ github.run_id }}
+          restore-keys: ccache-${{ env.PSX_COMMIT }}-
+
+      - name: Compilar libmain.so
+        run: |
+          set -euo pipefail
+          cp android/CMakeLists.android.txt "$PROJ/CMakeLists.txt"
+          cp android/android_entry.c "$PROJ/android_entry.c"
+          ICACHE=OFF; if [ "${{ inputs.icache_off }}" = "true" ]; then ICACHE=ON; fi
+          ccache --max-size=2G
+          cmake -S "$PROJ" -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/sdl-install" \
+            -DSDL3_DIR="$GITHUB_WORKSPACE/sdl-install/lib/cmake/SDL3" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DANDROID_ENABLE_VULKAN=OFF \
+            -DANDROID_OPT_LEVEL="${{ inputs.opt_level || '3' }}" \
+            -DANDROID_ICACHE_OFF="$ICACHE"
+          cmake --build build --target psx-runtime -j"$(nproc)"
+          ccache -s
+          SO=$(find build -name libmain.so | head -1)
+          test -n "$SO"
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          cp "$SO" android/app/src/main/jniLibs/arm64-v8a/libmain.so
+          cp sdl-install/lib/libSDL3.so android/app/src/main/jniLibs/arm64-v8a/libSDL3.so
+          ls -la android/app/src/main/jniLibs/arm64-v8a
+
+      - name: Copiar Java do SDL
+        run: |
+          set -euo pipefail
+          cp -r sdl-src/android-project/app/src/main/java/org android/app/src/main/java/
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Montar APK
+        run: |
+          set -euo pipefail
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          gradle -p android assembleDebug --no-daemon
+          find android -name '*.apk'
+
+      - name: Enviar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: soul-reaver-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
